@@ -76,6 +76,7 @@ export async function prepareGatewayLifecycle(params: {
     mentionInbox,
     broadcast,
     cfgAtStart,
+    cronStorePath,
     pluginRuntime,
     authRateLimiter,
     nodeReapprovalCoordinator,
@@ -225,6 +226,7 @@ export async function prepareGatewayLifecycle(params: {
     hookClientIpConfig: initialHookClientIpConfig,
     cronState: createLazyGatewayCronState({
       scheduler: runtime.scheduler,
+      storePath: cronStorePath,
       cfg: cfgAtStart,
       deps,
       broadcast,
@@ -427,7 +429,6 @@ export async function prepareGatewayLifecycle(params: {
       step("auth-profile-usage", () => closeAuthProfileUsage(params.sdkResourceHost)),
       step("model-accounts", stopModelAccountsForClose),
       step("mention-inbox", () => mentionInbox.dispose()),
-      step("worktree-run-end", () => worktreeRunEnd.drain()),
       step("sandbox-registry", () => sandboxRegistry.drain()),
       step("talk-persistence", () => talkClose.drain()),
     ]);
@@ -533,6 +534,7 @@ export async function prepareGatewayLifecycle(params: {
           });
         },
         getPendingReplyCount: getTotalPendingReplies,
+        disposeAllCodeModeRuns: shutdownRuntime.disposeAllCodeModeRuns,
         updateCheckStop: runtimeState.stopGatewayUpdateCheck,
         configReloader: { stop: stopConfigReloaderForClose },
       },
@@ -555,6 +557,7 @@ export async function prepareGatewayLifecycle(params: {
         await withPluginRuntimeRegistryScope(pluginRuntime.registry, () =>
           shutdownRuntime.completeGatewayClose(
             {
+              retainSharedState: optsValue?.retainSharedState,
               resolveGatewayContext: runtime.resolvePluginGatewayContext,
               closePluginRegistry: (onRetirement) => pluginRuntime.close(onRetirement),
               pluginMetadata: {
@@ -597,10 +600,10 @@ export async function prepareGatewayLifecycle(params: {
                 : {}),
               drainActiveSessionsForShutdown: shutdownRuntime.drainActiveSessionsForShutdown,
               disposeAllBundleLspRuntimes: shutdownRuntime.disposeAllBundleLspRuntimes,
+              drainWorktreeRunEnd: () => worktreeRunEnd.drain(),
               drainRetainedOpenAiEmbeddingProviders:
                 shutdownRuntime.drainRetainedOpenAiEmbeddingProviders,
               stopGmailWatcher: shutdownRuntime.stopGmailWatcher,
-              disposeAllCodeModeRuns: shutdownRuntime.disposeAllCodeModeRuns,
               closeProviderTransportDispatcherPool:
                 shutdownRuntime.closeProviderTransportDispatcherPool,
             },
