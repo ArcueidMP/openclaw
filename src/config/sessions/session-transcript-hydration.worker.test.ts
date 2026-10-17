@@ -3,6 +3,7 @@ import type { WorkerTaskControl } from "@openclaw/worker-runtime/worker";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { openNodeSqliteDatabase } from "../../infra/node-sqlite.js";
+import { assertNoActiveSqliteReaders } from "../../infra/sqlite-reader-lifecycle.js";
 import { admitSqliteSchema } from "../../infra/sqlite-schema-facts.js";
 import type { WorkerTaskChannel } from "../../infra/worker-task-server.js";
 import { resolveZstdCodec } from "../../infra/zstd-codec.js";
@@ -42,6 +43,7 @@ function fixture(
       db: reader,
       close() {
         transactionsAtClose.push(reader.isTransaction);
+        assertNoActiveSqliteReaders(reader, "hydration cleanup");
         reader.close();
       },
     },
@@ -57,8 +59,10 @@ function fixture(
   ): WorkerTaskChannel => ({
     consumeInput() {},
     notify() {},
-    async request(value) {
-      const chunk = value as SessionTranscriptHydrationChunk;
+    async request(value, transferList) {
+      const chunk = structuredClone(value, {
+        transfer: transferList?.slice(),
+      }) as SessionTranscriptHydrationChunk;
       chunks.push(chunk);
       await onChunk?.(chunk);
       return { input: undefined, consumed() {} };
@@ -83,7 +87,7 @@ function fixture(
   return { writer, reader, chunks, controller, transactionsAtClose, stream };
 }
 
-it("keeps exact bytes and one snapshot across ACKs and keyset pages", async () => {
+it("keeps exact bytes and one snapshot across ACKs", async () => {
   const codec = resolveZstdCodec();
   if (!codec) {
     throw new Error("The hydration regression requires zstd support");
@@ -92,7 +96,7 @@ it("keeps exact bytes and one snapshot across ACKs and keyset pages", async () =
   // Split a multibyte code point and terminate exact slice multiples with an empty frame.
   texts[0] = `${" ".repeat(65535)}"🦞"`;
   texts[1] = "{}".padEnd(2 * 65536, " ");
-  texts[257] = "{}".padEnd(4 * 65536, " ");
+  texts[257] = "{}".padEnd(20 * 65536, " ");
   const f = fixture(
     texts.map((text, seq) =>
       seq === 257
@@ -104,6 +108,7 @@ it("keeps exact bytes and one snapshot across ACKs and keyset pages", async () =
         : { seq: seq === 0 ? -2 : seq, text },
     ),
   );
+  const decompress = vi.spyOn(codec, "decompress");
   let acknowledgements = 0;
   try {
     const result = await f.stream(async () => {
@@ -153,17 +158,18 @@ it("keeps exact bytes and one snapshot across ACKs and keyset pages", async () =
     ).toEqual([1, 257]);
     expect(f.transactionsAtClose).toEqual([false]);
     expect(f.reader.isOpen).toBe(false);
+    expect(decompress).toHaveBeenCalledTimes(1);
   } finally {
     f.writer.close();
   }
 });
 
 it.each(["cancel", "host-error"] as const)(
-  "closes the snapshot after %s before reading the next payload page",
+  "closes the snapshot after %s without decoding unread payloads",
   async (failure) => {
     const f = fixture([
-      ...Array.from({ length: 256 }, (_, seq) => ({ seq, text: "{}" })),
-      { seq: 256, compressed: new Uint8Array([0]), size: 1 },
+      ...Array.from({ length: 128 }, (_, seq) => ({ seq, text: "{}" })),
+      { seq: 128, compressed: new Uint8Array([0]), size: 1 },
     ]);
     const error = new Error(failure);
     try {

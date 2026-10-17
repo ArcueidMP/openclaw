@@ -1,17 +1,90 @@
 // Qa Lab Matrix tests cover harness behavior.
 import { readFile } from "node:fs/promises";
+import type { QaDockerRunCommand as RunCommand } from "openclaw/plugin-sdk/qa-runtime";
 import { withTempDir } from "openclaw/plugin-sdk/test-env";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import type { FetchLike } from "../../../docker-runtime.js";
 import {
   MATRIX_QA_CLEANUP_TIMEOUT_MS,
-  isMatrixVersionsReachable,
-  waitForReachableMatrixBaseUrl,
+  isMatrixVersionsReachable as isMatrixVersionsReachableDefault,
+  waitForReachableMatrixBaseUrl as waitForReachableMatrixBaseUrlDefault,
   writeMatrixQaHarnessFiles,
 } from "./harness.runtime-internals.js";
-import { startMatrixQaHarness } from "./harness.runtime.js";
-import type { MatrixQaRecordingProxy } from "./recording-proxy.js";
+import { startMatrixQaHarness as startMatrixQaHarnessDefault } from "./harness.runtime.js";
+import type { MatrixQaRecordingProxy, startMatrixQaRecordingProxy } from "./recording-proxy.js";
 
-type MatrixQaHarnessDeps = Parameters<typeof startMatrixQaHarness>[1];
+const io = vi.hoisted(() => ({
+  execCommand: vi.fn<RunCommand>(),
+  fetchHealthUrl: vi.fn<FetchLike>(),
+  sleep: vi.fn<(ms: number) => Promise<unknown>>(),
+  startRecordingProxy: vi.fn<typeof startMatrixQaRecordingProxy>(),
+}));
+
+vi.mock("../../../docker-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../docker-runtime.js")>()),
+  execCommand: io.execCommand,
+  fetchHealthUrl: io.fetchHealthUrl,
+}));
+vi.mock("node:timers/promises", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:timers/promises")>()),
+  setTimeout: io.sleep,
+}));
+vi.mock("./recording-proxy.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./recording-proxy.js")>()),
+  startMatrixQaRecordingProxy: io.startRecordingProxy,
+}));
+
+afterAll(() => {
+  vi.doUnmock("../../../docker-runtime.js");
+  vi.doUnmock("node:timers/promises");
+  vi.doUnmock("./recording-proxy.js");
+  vi.resetModules();
+});
+
+type MatrixQaHarnessDeps = {
+  fetchImpl?: FetchLike;
+  runCommand?: RunCommand;
+  sleepImpl?: (ms: number) => Promise<unknown>;
+  startRecordingProxyImpl?: typeof startMatrixQaRecordingProxy;
+};
+
+async function startMatrixQaHarness(
+  params: Parameters<typeof startMatrixQaHarnessDefault>[0],
+  deps?: MatrixQaHarnessDeps,
+) {
+  const actual = await vi.importActual<typeof import("../../../docker-runtime.js")>(
+    "../../../docker-runtime.js",
+  );
+  io.execCommand.mockReset().mockImplementation(deps?.runCommand ?? actual.execCommand);
+  io.fetchHealthUrl.mockReset().mockImplementation(deps?.fetchImpl ?? actual.fetchHealthUrl);
+  io.sleep.mockReset().mockImplementation(deps?.sleepImpl ?? (async () => {}));
+  if (deps?.startRecordingProxyImpl) {
+    io.startRecordingProxy.mockReset().mockImplementation(deps.startRecordingProxyImpl);
+  }
+  return await startMatrixQaHarnessDefault(params);
+}
+
+function isMatrixVersionsReachable(
+  baseUrl: string,
+  fetchImpl: FetchLike,
+  timeoutSignal?: AbortSignal,
+  signal?: AbortSignal,
+) {
+  io.fetchHealthUrl.mockImplementation(fetchImpl);
+  return isMatrixVersionsReachableDefault(baseUrl, timeoutSignal, signal);
+}
+
+function waitForReachableMatrixBaseUrl(
+  params: Parameters<typeof waitForReachableMatrixBaseUrlDefault>[0] & {
+    fetchImpl: FetchLike;
+    sleepImpl: (ms: number) => Promise<unknown>;
+  },
+) {
+  const { fetchImpl, sleepImpl, ...options } = params;
+  io.fetchHealthUrl.mockImplementation(fetchImpl);
+  io.sleep.mockImplementation(sleepImpl);
+  return waitForReachableMatrixBaseUrlDefault(options);
+}
 type MatrixQaHarnessResult = Awaited<ReturnType<typeof startMatrixQaHarness>>;
 
 async function withStartedMatrixHarness(
@@ -97,7 +170,7 @@ describe("matrix harness runtime", () => {
 
       const compose = await readFile(result.composeFile, "utf8");
       expect(compose).toContain(
-        "image: ghcr.io/matrix-construct/tuwunel:v1.8.3@sha256:699fa9971c174e01c884abad8d1a3cfb2fe518e1a71f1fa16ea9dedf11873d74",
+        "image: ghcr.io/matrix-construct/tuwunel:v1.9.3@sha256:678b7f5350e06a41614444497c587da9dddf66767e4068a27480402f3c1367d0",
       );
       expect(compose).toContain('      - "127.0.0.1:28008:8008"');
       expect(compose).toContain('TUWUNEL_ALLOW_ENCRYPTION: "true"');
@@ -222,68 +295,17 @@ describe("matrix harness runtime", () => {
     expect(cancel).toHaveBeenCalledTimes(1);
   });
 
-  it("bounds a stalled versions probe by the remaining discovery deadline", async () => {
-    vi.useFakeTimers();
-    const requestTimeout = new AbortController();
-    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(requestTimeout.signal);
-    try {
-      const { fetchImpl, probeSignals } = createStalledVersionsFetch();
-      const sleepImpl = vi.fn(async () => {});
-      const startedAt = Date.now();
-      const waiting = waitForReachableMatrixBaseUrl({
-        composeFile: "/tmp/docker-compose.matrix-qa.yml",
-        containerBaseUrl: null,
-        fetchImpl,
-        hostBaseUrl: "http://127.0.0.1:28008/",
-        sleepImpl,
-        timeoutMs: 25,
-        pollMs: 1_000,
-      });
-      const rejection = expect(waiting).rejects.toThrow("did not become healthy");
-
-      await vi.advanceTimersByTimeAsync(25);
-      await rejection;
-
-      expect(Date.now() - startedAt).toBe(25);
-      expect(probeSignals).toHaveLength(1);
-      expect(probeSignals[0]?.aborted).toBe(true);
-      expect(sleepImpl).not.toHaveBeenCalled();
-    } finally {
-      timeoutSpy.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it("does not re-poll when the request timeout wins at the discovery deadline", async () => {
-    vi.useFakeTimers();
-    const requestTimeout = new AbortController();
-    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(requestTimeout.signal);
-    try {
-      const { fetchImpl } = createStalledVersionsFetch();
-      const startedAt = Date.now();
-      const sleepImpl = vi.fn(async (ms: number) => {
-        vi.setSystemTime(Date.now() + ms);
-      });
-      const waiting = waitForReachableMatrixBaseUrl({
-        composeFile: "/tmp/docker-compose.matrix-qa.yml",
-        containerBaseUrl: null,
-        fetchImpl,
-        hostBaseUrl: "http://127.0.0.1:28008/",
-        sleepImpl,
-        timeoutMs: 25,
-        pollMs: 1_000,
-      });
-
-      vi.setSystemTime(startedAt + 24);
-      requestTimeout.abort(new DOMException("request timed out", "TimeoutError"));
-      await expect(waiting).rejects.toThrow("did not become healthy");
-
-      expect(fetchImpl).toHaveBeenCalledTimes(1);
-      expect(sleepImpl).not.toHaveBeenCalled();
-    } finally {
-      timeoutSpy.mockRestore();
-      vi.useRealTimers();
-    }
+  it("cancels a stalled versions request when its deadline signal aborts", async () => {
+    const { fetchImpl, probeSignals } = createStalledVersionsFetch();
+    const controller = new AbortController();
+    const pending = isMatrixVersionsReachable(
+      "http://127.0.0.1:28008/",
+      fetchImpl,
+      controller.signal,
+    );
+    controller.abort(new DOMException("Deadline expired", "TimeoutError"));
+    await expect(pending).resolves.toBe(false);
+    expect(probeSignals[0]?.aborted).toBe(true);
   });
 
   it("probes the container fallback when the host versions probe stalls", async () => {

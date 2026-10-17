@@ -30,6 +30,9 @@ import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { resetPluginBlobStoreForTests } from "./plugin-blob-store.js";
 import {
   createPluginStateKeyedStore,
+  createPluginStateKeyedStoreV2,
+  createPluginStateRuntimeStores,
+  createPluginStateSyncKeyedStore,
   resetPluginStateStoreForTests,
 } from "./plugin-state-store.js";
 
@@ -205,10 +208,13 @@ describe("plugin-state-store.authority", () => {
                 throw new Error("Visitor Access did not create its invitation tool");
               }
               providerConfirmed = false;
-              const posting = vi.spyOn(Worker.prototype, "postMessage");
-              const submittedRenewals = () => {
-                const submitted: unknown[] = [];
-                for (const [message] of posting.mock.calls) {
+              const submittedRenewals: unknown[] = [];
+              // oxlint-disable-next-line typescript/unbound-method -- call supplies the intercepted worker receiver.
+              const nativePost = Worker.prototype.postMessage;
+              const posting = vi
+                .spyOn(Worker.prototype, "postMessage")
+                .mockImplementation(function (this: Worker, message, transferList) {
+                  let renewalJson: string | undefined;
                   const request = asOptionalRecord(message);
                   if (request?.type === "execute" && request.input instanceof Uint8Array) {
                     const operation = asOptionalRecord(deserialize(request.input));
@@ -223,15 +229,17 @@ describe("plugin-state-store.authority", () => {
                       if (typeof input.valueJson !== "string") {
                         throw new Error("Expected the native visitor grant submission");
                       }
-                      submitted.push(JSON.parse(input.valueJson));
+                      renewalJson = input.valueJson;
                     }
                   }
-                }
-                return submitted;
-              };
+                  nativePost.call(this, message, transferList);
+                  if (renewalJson !== undefined) {
+                    submittedRenewals.push(JSON.parse(renewalJson));
+                  }
+                });
               let heldCommit = false;
               const admission = probe.admission(mutationAdmission, (request, grant, admit) => {
-                if (request.stage === "commit" && !heldCommit && submittedRenewals().length > 0) {
+                if (request.stage === "commit" && !heldCommit && submittedRenewals.length > 0) {
                   heldCommit = true;
                   // The native transaction already wrote its candidate; only its real commit guard remains.
                   vi.setSystemTime(previous.expiresAt + 1);
@@ -241,7 +249,7 @@ describe("plugin-state-store.authority", () => {
               try {
                 const renewal = await invite.execute("renew", { email, days: 2 });
                 expect(heldCommit).toBe(true);
-                expect(submittedRenewals()).toEqual([
+                expect(submittedRenewals).toEqual([
                   { ...previous, expiresAt: previous.createdAt + 2 * 86_400_000 },
                 ]);
                 expect(renewal).toMatchObject({ isError: true, details: { error: true } });
@@ -445,6 +453,38 @@ describe("plugin-state-store.runtime", () => {
   });
 
   describe("plugin runtime state proxy", () => {
+    it("warns once per legacy factory and leaves V2 factories silent", async () => {
+      await withOpenClawTestState({ label: "plugin-state-factory-warning" }, async () => {
+        const pluginId = "sdk-state-factory-warning";
+        const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+        try {
+          const runtime = createPluginStateRuntimeStores(pluginId, () => {});
+          createPluginStateKeyedStoreV2(pluginId, keyedOptions, { assertCurrent() {} });
+          runtime.openKeyedStoreV2(keyedOptions);
+          expect(warning).not.toHaveBeenCalled();
+          createPluginStateSyncKeyedStore(pluginId, keyedOptions);
+          createPluginStateSyncKeyedStore(pluginId, keyedOptions);
+          runtime.openSyncKeyedStore(keyedOptions);
+          runtime.openSyncKeyedStore(keyedOptions);
+          expect(warning).toHaveBeenCalledTimes(2);
+          for (const [method, replacement] of [
+            ["createPluginStateSyncKeyedStore", "createPluginStateKeyedStoreV2"],
+            ["api.runtime.state.openSyncKeyedStore", "api.runtime.state.openKeyedStoreV2"],
+          ]) {
+            expect(warning).toHaveBeenCalledWith(
+              expect.stringContaining(`${method} is deprecated; use ${replacement}`),
+              { code: "DEP_PLUGIN_SDK", type: "DeprecationWarning" },
+            );
+          }
+          for (const [message] of warning.mock.calls) {
+            expect(message).toContain("first January 2027 stable release");
+          }
+        } finally {
+          warning.mockRestore();
+        }
+      });
+    });
+
     it("binds keyed stores to local plugin ids and keeps resolveStateDir", async () => {
       await withOpenClawTestState({ label: "plugin-state-runtime" }, async (state) => {
         const record = createPluginRecord("discord", "config");

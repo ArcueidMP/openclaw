@@ -267,7 +267,7 @@ describe("startGatewayEventSubscriptions", () => {
         ensureMaterialized: () => prepared.promise,
         withPreparedExactRows: async (_queries: unknown, consume: (read: unknown) => unknown) => {
           await prepared.promise;
-          return { kind: "complete" as const, value: consume(undefined) };
+          return consume(undefined);
         },
         isCurrent: (record: typeof original) => record === current,
         snapshot: () => ({ row: current ? { key: "agent:main:queued", ...current } : null }),
@@ -968,6 +968,8 @@ describe("startGatewayEventSubscriptions", () => {
     createParams,
     installHandlerFactory: (factory) => agentEventHandlerMocks.create.mockImplementation(factory),
     start: (params) => {
+      // These cases exercise a successful no-subscriber handoff, not the injected failure handler.
+      transcriptBroadcastMocks.useActualHandler = true;
       unsubs = startGatewayEventSubscriptions(params);
     },
   });

@@ -25,19 +25,17 @@ export function createDiagnosticsMetrics(
       description,
       ...(explicitBucketBoundaries ? { advice: { explicitBucketBoundaries } } : {}),
     });
+  const createDurationHistogram = (name: string, description: string) =>
+    createHistogram(name, description, "ms", AGENT_DURATION_MS_BUCKETS);
 
   return {
-    gcDurationHistogram: createHistogram(
+    gcDurationHistogram: createDurationHistogram(
       "gc.duration_ms",
       "Elapsed garbage collection duration for the hosting JavaScript isolate",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
     ),
-    gatewayEventLoopDelayMaxHistogram: createHistogram(
+    gatewayEventLoopDelayMaxHistogram: createDurationHistogram(
       "gateway.event_loop.delay_max_ms",
       "Maximum event-loop delay per completed Gateway observation window",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
     ),
     gatewayEventLoopObservedCounter: createCounter(
       "gateway.event_loop.observed_ms",
@@ -48,33 +46,38 @@ export function createDiagnosticsMetrics(
       "gateway.rpc.requests",
       "Authenticated Gateway WebSocket requests received",
     ),
+    gatewayWsEventsCounter: createCounter(
+      "gateway.ws.events",
+      "Outbound Gateway WebSocket event frames accepted by the sender per socket",
+    ),
+    gatewayWsEventBytesCounter: createCounter(
+      "gateway.ws.event_bytes",
+      "Encoded outbound Gateway WebSocket event bytes before framing or compression per socket",
+      "By",
+    ),
+    gatewayWsOperatorConnectionsGauge: meter.createGauge(
+      `${metricNamePrefix}gateway.ws.operator_connections`,
+      { unit: "1", description: "Connected authenticated Gateway operator WebSockets" },
+    ),
     gatewayRpcOutcomesCounter: createCounter(
       "gateway.rpc.outcomes",
       "Gateway RPC observations by phase and outcome",
     ),
-    gatewayRpcFirstResponseHistogram: createHistogram(
+    gatewayRpcFirstResponseHistogram: createDurationHistogram(
       "gateway.rpc.first_response_ms",
       "Elapsed time until the first Gateway RPC response is sent",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
     ),
-    gatewayRpcHandlerHistogram: createHistogram(
+    gatewayRpcHandlerHistogram: createDurationHistogram(
       "gateway.rpc.handler_ms",
       "Gateway RPC handler duration until return or throw",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
     ),
-    gatewayRpcAdmissionHistogram: createHistogram(
+    gatewayRpcAdmissionHistogram: createDurationHistogram(
       "gateway.rpc.admission_ms",
       "Elapsed time from Gateway RPC receipt until handler invocation",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
     ),
-    gatewayRpcQueueWaitHistogram: createHistogram(
+    gatewayRpcQueueWaitHistogram: createDurationHistogram(
       "gateway.rpc.queue_wait_ms",
       "Gateway operator start queue or worker frame queue wait",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
     ),
     tokensCounter: createCounter("tokens", "Token usage by type"),
     genAiTokenUsageHistogram: meter.createHistogram("gen_ai.client.token.usage", {
@@ -92,17 +95,10 @@ export function createDiagnosticsMetrics(
       },
     }),
     costCounter: createCounter("cost.usd", "Estimated model cost (USD)"),
-    durationHistogram: createHistogram(
-      "run.duration_ms",
-      "Agent run duration",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
-    ),
-    harnessDurationHistogram: createHistogram(
+    durationHistogram: createDurationHistogram("run.duration_ms", "Agent run duration"),
+    harnessDurationHistogram: createDurationHistogram(
       "harness.duration_ms",
       "Agent harness lifecycle duration",
-      "ms",
-      AGENT_DURATION_MS_BUCKETS,
     ),
     contextHistogram: createHistogram(
       "context.tokens",

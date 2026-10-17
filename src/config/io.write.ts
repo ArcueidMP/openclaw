@@ -10,6 +10,7 @@ import {
 } from "../infra/deferred-plugin-migrations.js";
 import { isVitestRuntimeEnv } from "../infra/env.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { readExistingStateRootMode } from "../infra/private-dir-mode.js";
 import {
   getUpdateDoctorConfigWriteAuthority,
   assertUpdateDoctorConfigInputHash,
@@ -64,16 +65,14 @@ import {
   restoreAuthoredTildePathsForWrite,
 } from "./io.read-helpers.js";
 import { loggedConfigWarningFingerprints, setBoundedConfigIoWarningEntry } from "./io.state.js";
-import type {
-  ConfigWriteInputBasis,
-  ConfigWriteOptions,
-  InternalConfigWriteResult,
-  ReadConfigFileSnapshotInternalResult,
-} from "./io.types.js";
 import {
   ConfigRuntimeRefreshError,
   configWriteCommittedSnapshot,
   configWritePostCommitRollback,
+  type ConfigWriteInputBasis,
+  type ConfigWriteOptions,
+  type InternalConfigWriteResult,
+  type ReadConfigFileSnapshotInternalResult,
 } from "./io.types.js";
 import { logConfigWarningsOnce } from "./io.warnings.js";
 import {
@@ -103,7 +102,7 @@ import { preflightRuntimeSnapshotWrite } from "./runtime-snapshot.js";
 import type { OpenClawConfig } from "./types.js";
 import { validateConfigObjectRawWithPlugins } from "./validation.js";
 import { rejectConfigNonFiniteNumbers } from "./value-tree.js";
-import { composeConfigWriteAssertions } from "./write-authority.js";
+import { bindConfigWriteLockGuard } from "./write-authority.js";
 import { captureConfigWriteLockGuard } from "./write-lock.js";
 
 export async function writeConfigFileFromContext(
@@ -113,23 +112,9 @@ export async function writeConfigFileFromContext(
   readSnapshot: () => Promise<ReadConfigFileSnapshotInternalResult>,
 ): Promise<InternalConfigWriteResult> {
   const { deps, configPath, options: ioOptions } = context;
-  let options = writeOptions;
   const sourceGuard = captureConfigWriteLockGuard(configPath);
   const doctorAuthority = getUpdateDoctorConfigWriteAuthority(configPath);
-  if (sourceGuard) {
-    const original = options;
-    options = {
-      ...options,
-      assertConfigPathForWrite: composeConfigWriteAssertions(
-        sourceGuard,
-        original.assertConfigPathForWrite,
-      ),
-      beforeCommit: async () => {
-        await original.beforeCommit?.();
-        sourceGuard();
-      },
-    };
-  }
+  let options = bindConfigWriteLockGuard(writeOptions, sourceGuard);
   options.assertConfigPathForWrite?.();
   assertConfigWriteAllowedInCurrentMode({ configPath, env: deps.env });
   const unsetPaths = resolveManagedUnsetPathsForWrite(options.unsetPaths);
@@ -343,7 +328,8 @@ export async function writeConfigFileFromContext(
   const includeFileHashes: Record<string, string> = {};
   const includeFileTargets: Record<string, string> = {};
   const sourceConfigForPreflight = context.resolveRuntimePreflightSourceConfig(
-    stampedOutputConfig,
+    // Receipts must reflect JSON omissions, just like a later read of this file.
+    JSON.parse(json),
     includeFileHashes,
     includeFileTargets,
     validationEnvBase,
@@ -536,6 +522,7 @@ export async function writeConfigFileFromContext(
       });
     await using preparedFile = await prepareConfigFileWrite({
       configPath,
+      dirMode: readExistingStateRootMode(path.dirname(configPath), stateDirectory.path, deps.fs),
       content: json,
       previousRaw: snapshot.raw,
       fsModule: writeGuard.fileSystem,
@@ -548,6 +535,7 @@ export async function writeConfigFileFromContext(
     const result = withDeferredPluginMigrationsCurrent(
       { env: deps.env, configPath, expectedPending: pendingMigrations },
       () => {
+        options.assertBeforePublish?.();
         const published = preparedFile.publish();
         publication.phase = "published";
         return published;

@@ -34,6 +34,7 @@ type SettingsRowProps = {
   carapace?: boolean;
   stacked?: boolean;
   stackedOnNarrow?: boolean;
+  nested?: boolean;
 };
 
 export function SettingsPage(props: {
@@ -80,10 +81,17 @@ export function SettingsPageHeader(props: {
   title: JSX.Element;
   subtitle?: JSX.Element;
   actions?: JSX.Element;
+  /** Keep title and subtitle together below floating shell chrome. */
+  stacked?: boolean;
 }) {
   return (
-    <ShellLayoutBoundary traits={{ toolbarHeader: true }}>
-      <section class="content-header content-header--settings">
+    <ShellLayoutBoundary traits={{ toolbarHeader: !props.stacked }}>
+      <section
+        class={[
+          "content-header content-header--settings",
+          { "content-header--stacked": props.stacked },
+        ]}
+      >
         <div>
           <h1 class="page-title">{props.title}</h1>
           <Show when={props.subtitle}>
@@ -209,6 +217,7 @@ export function SettingsRow(props: SettingsRowProps & { role?: "alert" | "status
         {
           "settings-row--stacked": props.stacked,
           "settings-row--stacked-on-narrow": props.stackedOnNarrow,
+          "settings-row--nested": props.nested,
           "oc-settings-row": props.carapace,
           "oc-settings-row-stacked": props.carapace && props.stacked,
         },
@@ -282,6 +291,8 @@ export function SettingsToggleRow(
     title: JSX.Element;
     ariaLabel?: JSX.Element;
     description?: JSX.Element;
+    /** Secondary actions beside the switch, such as opening related settings. */
+    actions?: JSX.Element;
   },
 ) {
   const titleId = nextSettingsRadioName();
@@ -293,6 +304,7 @@ export function SettingsToggleRow(
       {props.icon}
       <SettingsRowText id={titleId} title={props.title} description={props.description} />
       <div class="settings-row__control">
+        {props.actions}
         <ToggleControl
           {...props}
           label={props.ariaLabel}

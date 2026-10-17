@@ -88,11 +88,13 @@ it("acquires wrapper leases and manages templates without the application comman
     "src/state/openclaw-state-lease.ts",
     "src/state/openclaw-state-db.ts",
     "src/state/openclaw-state.worker.ts",
+    "src/state/openclaw-state-read.worker.ts",
     "src/state/openclaw-state-lease-worker.ts",
     "src/state/openclaw-state-lease-heartbeat.worker.ts",
     "src/infra/gateway-state-owner-heartbeat.worker.ts",
     "src/infra/sqlite-store.worker.ts",
     "src/infra/sqlite-readonly-location.worker.ts",
+    "src/infra/worker-native-lifecycle.worker.ts",
   ]);
   expect(existsSync(join(root, "src/state/openclaw-state-worker-runtime.ts"))).toBe(false);
   const result = spawnSync(
@@ -509,4 +511,26 @@ it.each([
 ])("keeps $name free of eager validation imports", ({ entrypoints, deferredOwners }) => {
   const closure = collectRuntimeImportClosure(process.cwd(), entrypoints);
   expect(closure.filter((file) => deferredOwners.includes(file))).toEqual([]);
+});
+
+it("keeps Git operation workers independent of worktree allocation and registry owners", () => {
+  const closure = collectRuntimeImportClosure(
+    process.cwd(),
+    ["src/infra/git-operation.worker.ts"],
+    {
+      includeDynamicImports: true,
+    },
+  );
+  expect(closure).not.toContain("src/agents/worktrees/service-preparation.ts");
+  expect(closure).not.toContain("src/agents/worktrees/allocation.ts");
+});
+
+it("keeps Ollama config metadata independent of provider runtime helpers", () => {
+  const closure = collectRuntimeImportClosure(process.cwd(), [
+    "extensions/ollama/src/defaults.ts",
+    "extensions/ollama/provider-policy-api.ts",
+  ]);
+  expect(closure).not.toContain("src/plugin-sdk/provider-model-shared.ts");
+  expect(closure).not.toContain("src/plugin-sdk/plugin-entry.ts");
+  expect(closure).not.toContain("src/plugins/provider-replay-helpers.ts");
 });

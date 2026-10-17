@@ -1,4 +1,3 @@
-import type { DatabaseSync } from "node:sqlite";
 import { sql, type Expression, type RawBuilder } from "kysely";
 import { jsonPathValue, jsonRemovePaths } from "../../infra/database-engine/json-values.js";
 import {
@@ -8,7 +7,7 @@ import {
   prepareSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
 import { supportsNodeSqliteJsonb } from "../../infra/node-sqlite.js";
-import { isPostgresSqlConnection } from "../../infra/sql-connection.js";
+import { isPostgresSqlConnection, type EngineConnection } from "../../infra/sql-connection.js";
 import { getAdmittedSqliteSchemaFacts } from "../../infra/sqlite-schema-facts.js";
 import { resolveZstdCodec } from "../../infra/zstd-codec.js";
 import type { DB } from "../../state/openclaw-agent-db.generated.js";
@@ -21,15 +20,23 @@ import {
 } from "./session-model-context-projection.js";
 import { projectSessionTranscriptReportFacts } from "./session-transcript-report-facts.js";
 import {
+  MAX_COMPRESSED_EVENT_BYTES,
+  type TranscriptPayloadAlias,
+} from "./transcript-payload-read.js";
+import {
   deriveTranscriptPredicateFields,
   type TranscriptPredicateFields,
 } from "./transcript-predicate-fields.js";
 
-export const MAX_COMPRESSED_EVENT_BYTES = 4 * 1024 * 1024;
+export {
+  MAX_COMPRESSED_EVENT_BYTES,
+  readTranscriptPayload,
+  transcriptEventJsonSql,
+  type TranscriptPayloadAlias,
+} from "./transcript-payload-read.js";
+
 const MAX_NAVIGATION_BYTES = 16 * 1024;
 const MIN_COMPRESS_BYTES = 1024;
-const DECODE_FUNCTION = "openclaw_transcript_payload_decode";
-const registeredDecoders = new WeakSet<DatabaseSync>();
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export type TranscriptPayloadRecord = TranscriptPredicateFields & {
@@ -45,39 +52,23 @@ export type PreparedTranscriptPayload = {
   payload: TranscriptPayloadRecord;
 };
 
-export type TranscriptPayloadAlias = "transcript_events" | "event" | "te" | "parent";
+export type TranscriptEventInsertRow = {
+  seq: number;
+  eventJson: string;
+  createdAt: number;
+  eventId?: string;
+  parsedEvent?: unknown;
+  preparedPayload?: PreparedTranscriptPayload;
+};
+
+// Fourteen bound columns per row stay below SQLite's conservative 999-parameter limit.
+export const TRANSCRIPT_INSERT_BATCH_SIZE = 64;
 
 /** Physical payload writes participate in the transcript owner's admitted transaction. */
-export function createTranscriptEventInserter(database: DatabaseSync, sessionId: string) {
-  const insert = prepareSqliteQuerySync<
-    TranscriptPayloadRecord & { seq: number; createdAt: number }
-  >(database, (parameter) =>
-    getNodeSqliteKysely<Pick<DB, "transcript_events">>(database)
-      .insertInto("transcript_events")
-      .values({
-        session_id: sessionId,
-        seq: parameter((row) => row.seq),
-        event_json: parameter((row) => row.event_json),
-        event_zstd: parameter((row) => row.event_zstd),
-        event_utf8_bytes: parameter((row) => row.event_utf8_bytes),
-        navigation_json: parameter((row) => row.navigation_json),
-        navigation_type: parameter((row) => row.navigation_type),
-        navigation_custom_type: parameter((row) => row.navigation_custom_type),
-        navigation_display: parameter((row) => row.navigation_display),
-        message_role: parameter((row) => row.message_role),
-        navigation_last_type: parameter((row) => row.navigation_last_type),
-        navigation_last_custom_type: parameter((row) => row.navigation_last_custom_type),
-        navigation_valid: parameter((row) => row.navigation_valid),
-        created_at: parameter((row) => row.createdAt),
-      }),
-  );
-  return (row: {
-    seq: number;
-    eventJson: string;
-    createdAt: number;
-    parsedEvent?: unknown;
-    preparedPayload?: PreparedTranscriptPayload;
-  }) => {
+export function createTranscriptEventInserter(database: EngineConnection, sessionId: string) {
+  const kysely =
+    getNodeSqliteKysely<Pick<DB, "transcript_events" | "transcript_event_identities">>(database);
+  const prepareRow = (row: TranscriptEventInsertRow) => {
     const prepared = row.preparedPayload;
     const payload =
       prepared?.eventJson === row.eventJson &&
@@ -85,11 +76,104 @@ export function createTranscriptEventInserter(database: DatabaseSync, sessionId:
       (!isPostgresSqlConnection(database) || prepared.payload.event_zstd === null)
         ? prepared.payload
         : prepareTranscriptPayload(database, row.eventJson, row.parsedEvent);
-    return insert({ ...row, ...payload });
+    return { session_id: sessionId, seq: row.seq, ...payload, created_at: row.createdAt };
   };
+  type StoredRow = ReturnType<typeof prepareRow>;
+  const columns = [
+    "session_id",
+    "seq",
+    "event_json",
+    "event_zstd",
+    "event_utf8_bytes",
+    "navigation_json",
+    "navigation_type",
+    "navigation_custom_type",
+    "navigation_display",
+    "message_role",
+    "navigation_last_type",
+    "navigation_last_custom_type",
+    "navigation_valid",
+    "created_at",
+  ] as const;
+  // Each executor is used only with the chunk length that defines its bound indexes.
+  const createBatchInsert = (count: number) =>
+    prepareSqliteQuerySync<readonly StoredRow[]>(database, (parameter) =>
+      kysely.insertInto("transcript_events").values(
+        Array.from({ length: count }, (_, index) => ({
+          session_id: sessionId,
+          seq: parameter((rows) => rows[index]!.seq),
+          event_json: parameter((rows) => rows[index]!.event_json),
+          event_zstd: parameter((rows) => rows[index]!.event_zstd),
+          event_utf8_bytes: parameter((rows) => rows[index]!.event_utf8_bytes),
+          navigation_json: parameter((rows) => rows[index]!.navigation_json),
+          navigation_type: parameter((rows) => rows[index]!.navigation_type),
+          navigation_custom_type: parameter((rows) => rows[index]!.navigation_custom_type),
+          navigation_display: parameter((rows) => rows[index]!.navigation_display),
+          message_role: parameter((rows) => rows[index]!.message_role),
+          navigation_last_type: parameter((rows) => rows[index]!.navigation_last_type),
+          navigation_last_custom_type: parameter(
+            (rows) => rows[index]!.navigation_last_custom_type,
+          ),
+          navigation_valid: parameter((rows) => rows[index]!.navigation_valid),
+          created_at: parameter((rows) => rows[index]!.created_at),
+        })),
+      ),
+    );
+  const batchInserts = new Map<number, ReturnType<typeof createBatchInsert>>();
+  const batch = (rows: readonly TranscriptEventInsertRow[]) => {
+    for (let offset = 0; offset < rows.length; offset += TRANSCRIPT_INSERT_BATCH_SIZE) {
+      const prepared = rows.slice(offset, offset + TRANSCRIPT_INSERT_BATCH_SIZE).map(prepareRow);
+      let insert = batchInserts.get(prepared.length);
+      if (!insert) {
+        insert = createBatchInsert(prepared.length);
+        batchInserts.set(prepared.length, insert);
+      }
+      insert(prepared);
+    }
+  };
+  const createIdentityInsert = () =>
+    prepareSqliteQueryTakeFirstSync<StoredRow & { eventId: string }, { seq: number }>(
+      database,
+      (parameter) =>
+        kysely
+          .insertInto("transcript_events")
+          .columns(columns)
+          .expression(
+            kysely
+              .selectNoFrom(columns.map((column) => parameter((row) => row[column]).as(column)))
+              .where((eb) =>
+                eb.not(
+                  eb.exists(
+                    eb
+                      .selectFrom("transcript_event_identities")
+                      .select("event_id")
+                      .where("session_id", "=", sessionId)
+                      .where(
+                        "event_id",
+                        "=",
+                        parameter((row) => row.eventId),
+                      ),
+                  ),
+                ),
+              ),
+          )
+          .returning("seq"),
+    );
+  let insertIdentity: ReturnType<typeof createIdentityInsert> | undefined;
+  return Object.assign(
+    (row: TranscriptEventInsertRow): boolean => {
+      if (row.eventId === undefined) {
+        batch([row]);
+        return true;
+      }
+      insertIdentity ??= createIdentityInsert();
+      return insertIdentity({ ...prepareRow(row), eventId: row.eventId }) !== undefined;
+    },
+    { batch },
+  );
 }
 
-export function createTranscriptPayloadUpdater(database: DatabaseSync, sessionId: string) {
+export function createTranscriptPayloadUpdater(database: EngineConnection, sessionId: string) {
   return prepareSqliteQuerySync<TranscriptPayloadRecord & { seq: number }>(database, (parameter) =>
     getNodeSqliteKysely<Pick<DB, "transcript_events">>(database)
       .updateTable("transcript_events")
@@ -115,7 +199,7 @@ export function createTranscriptPayloadUpdater(database: DatabaseSync, sessionId
   );
 }
 
-export function readTranscriptStorageEncoding(database: DatabaseSync): string {
+export function readTranscriptStorageEncoding(database: EngineConnection): string {
   if (isPostgresSqlConnection(database)) {
     return "UTF-8";
   }
@@ -126,9 +210,15 @@ export function readTranscriptStorageEncoding(database: DatabaseSync): string {
   return facts.textEncoding;
 }
 
+/** Matches stored transcript byte accounting, including the exported JSONL newline. */
+export function transcriptSerializedBytes(database: EngineConnection, eventJson: string): number {
+  const encoding = readTranscriptStorageEncoding(database) === "UTF-8" ? "utf8" : "utf16le";
+  return Buffer.byteLength(eventJson, encoding) + 1;
+}
+
 /** Prepared bytes grant no write authority and must match the eventual envelope and encoding. */
 export function prepareTranscriptPayloadForReuse(
-  database: DatabaseSync,
+  database: EngineConnection,
   eventJson: string,
   parsedEvent?: unknown,
 ): PreparedTranscriptPayload {
@@ -141,7 +231,7 @@ export function prepareTranscriptPayloadForReuse(
 }
 
 function navigationProjection(
-  database: DatabaseSync,
+  database: EngineConnection,
   event: Expression<string | Uint8Array>,
   report: Expression<string>,
   originalEvent: Expression<string>,
@@ -163,7 +253,7 @@ function navigationProjection(
 }
 
 type NavigationInput = { eventJson: string; reportJson: string };
-const navigationReader = createSqliteQueryCache((database: DatabaseSync) =>
+const navigationReader = createSqliteQueryCache((database: EngineConnection) =>
   prepareSqliteQueryTakeFirstSync<NavigationInput, { navigation_json: string | null }>(
     database,
     (parameter) => {
@@ -222,7 +312,7 @@ const navigationReader = createSqliteQueryCache((database: DatabaseSync) =>
   ),
 );
 
-function readNavigation(database: DatabaseSync, input: NavigationInput): string | null {
+function readNavigation(database: EngineConnection, input: NavigationInput): string | null {
   const navigation = navigationReader(database)(input)?.navigation_json ?? null;
   return navigation !== null && Buffer.byteLength(navigation, "utf8") <= MAX_NAVIGATION_BYTES
     ? navigation
@@ -231,7 +321,7 @@ function readNavigation(database: DatabaseSync, input: NavigationInput): string 
 
 /** Prepare canonical UTF-8 bytes and native query metadata before publishing a transcript row. */
 export function prepareTranscriptPayload(
-  database: DatabaseSync,
+  database: EngineConnection,
   eventJson: string,
   parsedEvent?: unknown,
   storageEncoding = readTranscriptStorageEncoding(database),
@@ -296,80 +386,8 @@ export function prepareTranscriptPayload(
   return { ...identity, event_json: null, event_zstd: compressed, navigation_json: navigation };
 }
 
-function registerDecoder(database: DatabaseSync): void {
-  if (registeredDecoders.has(database)) {
-    return;
-  }
-  database.function(
-    DECODE_FUNCTION,
-    { deterministic: true, directOnly: true },
-    decodeCompressedTranscriptPayload,
-  );
-  registeredDecoders.add(database);
-}
-
-function decodeCompressedTranscriptPayload(bytes: unknown, rawBytes: unknown): string {
-  if (
-    !(bytes instanceof Uint8Array) ||
-    bytes.byteLength === 0 ||
-    bytes.byteLength > MAX_COMPRESSED_EVENT_BYTES ||
-    typeof rawBytes !== "number" ||
-    !Number.isSafeInteger(rawBytes) ||
-    rawBytes < 1 ||
-    rawBytes > MAX_COMPRESSED_EVENT_BYTES
-  ) {
-    throw new Error("Invalid compressed transcript payload bounds");
-  }
-  const codec = resolveZstdCodec();
-  if (!codec) {
-    throw new Error("Cannot decode compressed transcript payload: this runtime lacks zstd support");
-  }
-  const decoded = codec.decompress(bytes, rawBytes);
-  if (decoded.byteLength !== rawBytes) {
-    throw new Error("Compressed transcript payload length does not match its recorded UTF-8 size");
-  }
-  return utf8Decoder.decode(decoded);
-}
-
-/** Decode selected rows without copying expanded payloads back through SQLite. */
-export function readTranscriptPayload(
-  row: Pick<TranscriptPayloadRecord, "event_json" | "event_zstd" | "event_utf8_bytes">,
-): string {
-  return row.event_json ?? decodeCompressedTranscriptPayload(row.event_zstd, row.event_utf8_bytes);
-}
-
-/** Only selected bodies decode; identity TEXT remains inside SQLite for native repairs. */
-export function transcriptEventJsonSql(
-  database: DatabaseSync,
-  alias: TranscriptPayloadAlias = "transcript_events",
-): RawBuilder<string> {
-  if (isPostgresSqlConnection(database)) {
-    return /* kysely-allow-raw: closed transcript aliases select PostgreSQL's canonical text. */ sql.ref<string>(
-      `${alias}.event_json`,
-    );
-  }
-  registerDecoder(database);
-  const identity =
-    /* kysely-allow-raw: closed transcript aliases select the canonical identity column. */ sql.ref(
-      `${alias}.event_json`,
-    );
-  const compressed =
-    /* kysely-allow-raw: closed transcript aliases select the canonical compressed column. */ sql.ref(
-      `${alias}.event_zstd`,
-    );
-  const bytes =
-    /* kysely-allow-raw: closed transcript aliases select recorded canonical byte counts. */ sql.ref(
-      `${alias}.event_utf8_bytes`,
-    );
-  const decode = getNodeSqliteKysely<Record<string, never>>(database).fn<string>(DECODE_FUNCTION, [
-    compressed,
-    bytes,
-  ]);
-  return /* kysely-allow-raw: lazy selection evaluates identity expressions once and keeps giant TEXT out of the bounded JS decoder. */ sql<string>`coalesce(${identity}, ${decode})`;
-}
-
 export function transcriptEventNavigationSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   alias: TranscriptPayloadAlias = "transcript_events",
 ): RawBuilder<string> {
   const identity =
@@ -380,7 +398,7 @@ export function transcriptEventNavigationSql(
 }
 
 export function transcriptEventRunIdSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   alias: TranscriptPayloadAlias = "transcript_events",
 ): RawBuilder<string | null> {
   return jsonPathValue(
@@ -391,7 +409,7 @@ export function transcriptEventRunIdSql(
 }
 
 function storedProjectionSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   field: "navigation" | "reset" | "model",
   fallback: Expression<string>,
   alias: TranscriptPayloadAlias,
@@ -405,7 +423,7 @@ function storedProjectionSql(
 }
 
 export function transcriptEventResetNavigationSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   alias: TranscriptPayloadAlias = "transcript_events",
 ): RawBuilder<string> {
   const identity =
@@ -421,7 +439,7 @@ export function transcriptEventResetNavigationSql(
 }
 
 export function transcriptEventModelNavigationSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   alias: TranscriptPayloadAlias = "transcript_events",
   entryType?: Expression<unknown>,
 ): RawBuilder<string> {
@@ -439,7 +457,7 @@ export function transcriptEventModelNavigationSql(
 
 /** Model admission retains projected byte costs, which can be much smaller than canonical JSON. */
 export function transcriptEventModelBytesSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   omitCheckpoint: Expression<number>,
   alias: TranscriptPayloadAlias = "transcript_events",
 ): RawBuilder<number> {
@@ -464,7 +482,7 @@ export function transcriptEventModelBytesSql(
 
 /** Suffix admission can retain opaque custom data without charging or decoding its body. */
 export function transcriptEventWithoutCustomDataBytesSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   alias: TranscriptPayloadAlias = "transcript_events",
 ): RawBuilder<number> {
   const metadata =

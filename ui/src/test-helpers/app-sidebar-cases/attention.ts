@@ -362,12 +362,12 @@ describe("AppSidebar session attention", () => {
     expect(sidebar.querySelector('[data-session-attention="agent"]')).not.toBeNull();
 
     const owner = getAppSidebarOwner(sidebar.hostElement)!;
-    sidebar.requestUpdate();
+    sidebar.invalidate();
     provider.remove();
     await settleLitElement(sidebar);
-    const requestUpdate = vi.spyOn(owner, "requestUpdate");
+    const invalidate = vi.spyOn(owner, "invalidate");
     await vi.advanceTimersByTimeAsync(60_001);
-    expect(requestUpdate).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
 
     document.body.append(provider);
     await settleLitElement(sidebar);
@@ -406,9 +406,9 @@ describe("AppSidebar session attention", () => {
         `Waiting for approval\n${kind === "exec" ? "git status" : "Enable the calendar plugin"}`,
       );
       expect(indicator?.getAttribute("tabindex")).toBe("0");
-      expect(sidebar.querySelector(".sidebar-recent-session__subtitle")?.textContent).toBe(
-        "Waiting for approval",
-      );
+      const row = sidebar.querySelector(`[data-session-key="${sessionKey}"]`);
+      expect(row?.classList.contains("sidebar-recent-session--single-line")).toBe(true);
+      expect(row?.querySelector(".sidebar-recent-session__subtitle")).toBeNull();
       expect(sidebar.textContent).not.toContain("Run failed:");
     },
   );
@@ -504,12 +504,14 @@ describe("AppSidebar session attention", () => {
     expect(description).not.toContain("Run failed:");
 
     sidebar.sidebarAgentsMode = "roster";
+    const agentHeader = () =>
+      sidebar.querySelector('[data-agent-group="main"] .sidebar-agent-roster__header');
     await waitForFast(() => {
       expect(
         sidebar.querySelector(`openclaw-sidebar-agent-roster [data-session-key="${parentKey}"]`),
-      ).not.toBeNull();
+      ).toBeNull();
       expect(
-        parentRow()
+        agentHeader()
           ?.querySelector('[data-session-attention="error"]')
           ?.closest('[role="img"]')
           ?.getAttribute("aria-label"),
@@ -522,8 +524,8 @@ describe("AppSidebar session attention", () => {
     setRows(sessionsHarness, result.sessions);
     await rosterActivityStore(context).refresh();
     await waitForFast(() => {
-      expect(parentRow()).not.toBeNull();
-      expect(parentRow().querySelector('[data-session-attention="error"]')).toBeNull();
+      expect(agentHeader()).not.toBeNull();
+      expect(agentHeader()?.querySelector('[data-session-attention="error"]')).toBeNull();
     });
   });
 

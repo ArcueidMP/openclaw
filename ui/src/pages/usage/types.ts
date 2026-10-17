@@ -78,9 +78,9 @@ type UsageFilterState = {
   startDate: string;
   endDate: string;
   scope: "instance" | "family";
-  selectedSessions: string[]; // Support multiple session selection
-  selectedDays: string[]; // Support multiple day selection
-  selectedHours: number[]; // Support multiple hour selection
+  selectedSessions: string[];
+  selectedDays: string[];
+  selectedHours: number[];
   creatorKey: string | null;
   query: string;
   queryDraft: string;
@@ -125,7 +125,7 @@ type UsageCallbacks = {
     onScopeChange: (
       scope: Partial<Pick<UsageFilterState, "scope" | "creatorKey" | "timeZone">>,
     ) => void;
-    onRefresh: () => void;
+    onRefresh: () => void | Promise<void>;
     onToggleHeaderPinned: () => void;
     onSelectDay: (day: string, shiftKey: boolean, orderedDays: string[]) => void;
     onSelectHour: (hour: number, shiftKey: boolean) => void;

@@ -54,10 +54,7 @@ describe("terminal session ownership", () => {
       agentSessionId: "ui-session-id",
       agentId: "research",
     } as const;
-    const { opts, respond, runtimeConfig } = makeOpts(
-      { ...params, cols: 80, rows: 24 },
-      { enabled: true },
-    );
+    const { opts, respond, runtimeConfig } = makeOpts({ ...params, cols: 80, rows: 24 });
     runtimeConfig.agents = {
       ownership: "explicit",
       entries: { main: {}, research: { workspace } },
@@ -106,12 +103,13 @@ describe("terminal session ownership", () => {
       reading.resolve();
       return entry.promise;
     });
-    const terminalConfig = { enabled: true };
     const sandbox: { mode: "off" | "all" } = { mode: "off" };
-    const { opts, sessions, respond, runtimeConfig, isConnectionActive } = makeOpts(
-      { agentId: "research", sessionKey: "agent:research:ui-session", cols: 80, rows: 24 },
-      terminalConfig,
-    );
+    const { opts, sessions, respond, runtimeConfig, isConnectionActive } = makeOpts({
+      agentId: "research",
+      sessionKey: "agent:research:ui-session",
+      cols: 80,
+      rows: 24,
+    });
     runtimeConfig.agents = {
       ownership: "explicit",
       entries: { main: {}, research: { sandbox } },
@@ -124,7 +122,7 @@ describe("terminal session ownership", () => {
     if (change === "connection") {
       isConnectionActive.mockReturnValue(false);
     } else if (change === "disabled") {
-      terminalConfig.enabled = false;
+      expectDefined(runtimeConfig.gateway?.terminal, "terminal configuration").enabled = false;
     } else {
       sandbox.mode = "all";
     }
@@ -158,7 +156,7 @@ describe("terminal session ownership", () => {
     },
   ])("rejects UI ownership when the session $state", async ({ entry, error }) => {
     sessionMocks.loadGatewaySessionEntryReadOnlyInWorker.mockResolvedValue({ entry });
-    const { opts, sessions, respond } = makeOpts({}, { enabled: true });
+    const { opts, sessions, respond } = makeOpts({});
 
     await openTerminalSession(opts, {
       agentId: "main",
@@ -200,10 +198,7 @@ describe("terminal session ownership", () => {
       message: /runs in a sandbox/,
     },
   ])("rejects $name before creating a terminal", async ({ params, message, systemAgentId }) => {
-    const { opts, sessions, respond, runtimeConfig } = makeOpts(
-      { cols: 80, rows: 24, ...params },
-      { enabled: true },
-    );
+    const { opts, sessions, respond, runtimeConfig } = makeOpts({ cols: 80, rows: 24, ...params });
     runtimeConfig.agents = {
       ownership: "explicit",
       ...(systemAgentId ? { defaults: { systemAgent: { agentId: systemAgentId } } } : {}),

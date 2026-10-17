@@ -7,7 +7,6 @@ import { resolveOpenAICompletionsCompat } from "./transports/openai-completions-
 import type { AssistantMessage, Context, Model, UserMessage } from "./types.js";
 import { createZeroUsage } from "./usage.test-support.js";
 import {
-  SYSTEM_PROMPT_CACHE_BOUNDARY,
   SYSTEM_PROMPT_RELOCATABLE_BOUNDARY,
   SYSTEM_PROMPT_RELOCATABLE_BOUNDARY_END,
 } from "./utils/system-prompt-cache-boundary.js";
@@ -97,6 +96,7 @@ describe("convertMessages assistant text replay", () => {
       const converted = convertMessages(
         model,
         {
+          tools: [{ name: "lookup", description: "Lookup", parameters: { type: "object" } }],
           messages: [assistant, makeTextToolResult("call_lookup", "lookup", "found", false, 3)],
         },
         { ...resolveOpenAICompletionsCompat(model), requiresThinkingAsText },
@@ -147,6 +147,7 @@ describe("convertMessages assistant text replay", () => {
       timestamp: 1,
     };
     const context: Context = {
+      tools: [{ name: "lookup", description: "Lookup", parameters: { type: "object" } }],
       messages: [
         assistant,
         {
@@ -229,6 +230,7 @@ describe("convertMessages parallel tool-result image ownership", () => {
       `${prefix}d`,
     ];
     const context: Context = {
+      tools: [{ name: toolName, description: "Image tool", parameters: { type: "object" } }],
       messages: [
         makeToolCallAssistant(
           callIds,
@@ -270,10 +272,6 @@ describe("convertMessages relocatable region", () => {
   const compat = () => resolveOpenAICompletionsCompat(model);
   const marked = (facts: string) =>
     `${SYSTEM_PROMPT_RELOCATABLE_BOUNDARY}${facts}${SYSTEM_PROMPT_RELOCATABLE_BOUNDARY_END}`;
-  const contextForSession = (sessionId: string): Context => ({
-    systemPrompt: `Stable prefix${SYSTEM_PROMPT_CACHE_BOUNDARY}Reactions guidance${marked(`## Runtime\nRuntime: session=${sessionId}`)}`,
-    messages: [{ role: "user", content: "hi", timestamp: 1 }],
-  });
 
   it.each([
     {
@@ -357,6 +355,7 @@ describe("convertMessages relocatable region", () => {
     };
     const context: Context = {
       systemPrompt: `Stable prefix${marked("Runtime facts")}`,
+      tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
       messages: [
         { role: "user", content: [], timestamp: 1 },
         assistant,
@@ -441,20 +440,6 @@ describe("convertMessages relocatable region", () => {
     expect(cacheOptOutIndexes).toEqual(new Set([1]));
   });
 
-  it("leaves the boundary in place when the caller preserves it", () => {
-    const converted = convertMessages(model, contextForSession("alpha"), compat(), {
-      preserveSystemPromptCacheBoundary: true,
-    });
-
-    expect(converted).toEqual([
-      {
-        role: "system",
-        content: `Stable prefix${SYSTEM_PROMPT_CACHE_BOUNDARY}Reactions guidance\n## Runtime\nRuntime: session=alpha`,
-      },
-      { role: "user", content: "hi" },
-    ]);
-  });
-
   it.each([
     { reasoning: true, supportsDeveloperRole: false, noticeRole: "user" },
     { reasoning: true, supportsDeveloperRole: true, noticeRole: "developer" },
@@ -466,6 +451,7 @@ describe("convertMessages relocatable region", () => {
       // Moving Runtime to the last user turn used to rewrite the earlier cached prefix.
       const toolResult = "X".repeat(30000);
       const turn1: Context = {
+        tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
         systemPrompt: `Stable prefix${marked("Runtime: session=alpha")}`,
         messages: [{ role: "user", content: "user1", timestamp: 1 }],
       };

@@ -29,6 +29,7 @@ import {
 } from "../../config/sessions/session-sharing-store.native.js";
 import { rotateAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import { clearAgentRunContext } from "../../infra/agent-run-registry.js";
+import { loadOrCreateProcessDeviceIdentityAsync } from "../../infra/device-identity-async.js";
 import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.js";
 import { sqliteWorkerOwnerProbe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import { readUserTurnPromptReactionSource } from "../../sessions/user-turn-transcript-admission.js";
@@ -44,11 +45,67 @@ import { createChatRunState } from "../server-chat-state.js";
 import { handleGatewayRequest } from "../server-methods.js";
 import { resolveSessionMutationAuthorizationAsync } from "../session-sharing-authorization-async.js";
 import * as chatDispatch from "./chat-send-agent-dispatch.js";
+import { holdProjectedChatDispatch } from "./chat-send-authority.test-support.js";
 import { handleDirectExternalChatSend } from "./chat-send-external-entry.js";
 import { handleChatSend } from "./chat-send-handler.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
 type DispatchOptions = Parameters<typeof dispatch.dispatchInboundMessageWithProjectedDispatcher>[0];
+
+function createBindingContext() {
+  return {
+    chatAbortControllers: new Map(),
+    chatQueuedTurns: new Map(),
+    chatRunState: createChatRunState(),
+    dedupe: new Map(),
+    agentRunSeq: new Map(),
+    getRuntimeConfig,
+    addChatRun: vi.fn(),
+    removeChatRun: vi.fn(),
+    broadcast: vi.fn(),
+    broadcastToConnIds: vi.fn(),
+    nodeSendToSession: vi.fn(),
+    getSessionEventSubscriberConnIds: () => new Set<string>(),
+    logGateway: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+  } as unknown as GatewayRequestContext;
+}
+
+function createBindingClient(options: {
+  profileId: string;
+  signal: AbortSignal;
+  scopes: string[];
+  dashboard: boolean;
+  attested?: boolean;
+  admin?: boolean;
+}): GatewayClient {
+  return {
+    connId: "authoring-binding",
+    connectionSignal: options.signal,
+    ...(options.dashboard && options.attested !== false
+      ? {
+          internal: {
+            authenticatedControlUi: true as const,
+            ...(options.admin ? { controlUiAdmin: true as const } : {}),
+          },
+        }
+      : {}),
+    authenticatedUserProfile: {
+      profileId: options.profileId,
+      displayName: null,
+      hasAvatar: false,
+      updatedAt: 1,
+    },
+    connect: {
+      minProtocol: 1,
+      maxProtocol: 1,
+      role: "operator",
+      scopes: options.scopes,
+      client: options.dashboard
+        ? { id: "openclaw-control-ui", version: "test", platform: "web", mode: "webchat" }
+        : { id: "cli", version: "test", platform: "test", mode: "cli" },
+    },
+  };
+}
 
 const admissionScenarios = [
   "removed",
@@ -84,6 +141,7 @@ it.each(admissionScenarios)(
             ? "released"
             : scenario;
     await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+      await loadOrCreateProcessDeviceIdentityAsync();
       setRuntimeConfigSnapshot({});
       const runId = "retained-preparation";
       const sessionKey = scenario === "dashboard" ? "agent:main:main" : "agent:main:binding";
@@ -118,68 +176,29 @@ it.each(admissionScenarios)(
       }
       const connection = new AbortController();
       const hasCurrentClientAuthority = vi.fn(() => true);
-      const client: GatewayClient = {
-        connId: "authoring-binding",
-        connectionSignal: connection.signal,
-        ...(dashboard && scenario !== "dashboard-unattested"
-          ? {
-              internal: {
-                authenticatedControlUi: true as const,
-                ...(scenario !== "dashboard-writer" && !membershipRequired
-                  ? { controlUiAdmin: true as const }
-                  : {}),
-              },
-            }
-          : {}),
-        authenticatedUserProfile: {
-          profileId: profile.id,
-          displayName: null,
-          hasAvatar: false,
-          updatedAt: 1,
-        },
-        connect: {
-          minProtocol: 1,
-          maxProtocol: 1,
-          role: "operator",
-          scopes:
-            scenario === "narrow-first-send"
-              ? ["operator.sessions.write"]
-              : scenario === "dashboard-writer" || membershipRequired
-                ? ["operator.write"]
-                : dashboard
-                  ? ["operator.admin"]
-                  : ["operator.read", "operator.write", "operator.admin"],
-          client: dashboard
-            ? { id: "openclaw-control-ui", version: "test", platform: "web", mode: "webchat" }
-            : { id: "cli", version: "test", platform: "test", mode: "cli" },
-        },
-      };
+      const client = createBindingClient({
+        profileId: profile.id,
+        signal: connection.signal,
+        dashboard,
+        attested: scenario !== "dashboard-unattested",
+        admin: scenario !== "dashboard-writer" && !membershipRequired,
+        scopes:
+          scenario === "narrow-first-send"
+            ? ["operator.sessions.write"]
+            : scenario === "dashboard-writer" || membershipRequired
+              ? ["operator.write"]
+              : dashboard
+                ? ["operator.admin"]
+                : ["operator.read", "operator.write", "operator.admin"],
+      });
       const namespaceRun = prepareSystemAgentRunAdmission({}, runId, "main", "test");
-      const entered = createDeferred<DispatchOptions>();
-      const release = createDeferred();
-      const observeDispatch = vi.spyOn(chatDispatch, "startChatDispatch");
-      const holdDispatch = vi
-        .spyOn(dispatch, "dispatchInboundMessageWithProjectedDispatcher")
-        .mockImplementation(async (options) => {
-          entered.resolve(options);
-          await release.promise;
-          return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
-        });
-      const context = {
-        chatAbortControllers: new Map(),
-        chatQueuedTurns: new Map(),
-        chatRunState: createChatRunState(),
-        dedupe: new Map(),
-        agentRunSeq: new Map(),
-        getRuntimeConfig,
-        addChatRun: vi.fn(),
-        removeChatRun: vi.fn(),
-        broadcast: vi.fn(),
-        broadcastToConnIds: vi.fn(),
-        nodeSendToSession: vi.fn(),
-        getSessionEventSubscriberConnIds: () => new Set<string>(),
-        logGateway: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
-      } as unknown as GatewayRequestContext;
+      const {
+        entered,
+        release,
+        observe: observeDispatch,
+        hold: holdDispatch,
+      } = holdProjectedChatDispatch();
+      const context = createBindingContext();
       let owned: Parameters<typeof chatDispatch.startChatDispatch>[0] | undefined;
       let reply: ReturnType<typeof createReplyOperation> | undefined;
       let successor: ReturnType<typeof registerChatAbortController> | undefined;
@@ -426,6 +445,7 @@ it.each(
     await withOpenClawTestState(
       { scenario: "minimal", prepareProfileCatalog: true },
       async (state) => {
+        await loadOrCreateProcessDeviceIdentityAsync();
         setRuntimeConfigSnapshot({});
         const sessionKey = "agent:main:reaction-source";
         const sessionId = "reaction-source-session";
@@ -441,45 +461,20 @@ it.each(
         });
         addSessionMember(scope, { identityId: profile.id, addedBy: owner.id });
         const connection = new AbortController();
-        const client: GatewayClient = {
-          connId: "reaction-source-client",
-          connectionSignal: connection.signal,
-          internal: { authenticatedControlUi: true },
-          authenticatedUserProfile: {
-            profileId: profile.id,
-            displayName: null,
-            hasAvatar: false,
-            updatedAt: 1,
-          },
-          connect: {
-            minProtocol: 1,
-            maxProtocol: 1,
-            role: "operator",
-            scopes: ["operator.write"],
-            client: {
-              id: "openclaw-control-ui",
-              version: "test",
-              platform: "web",
-              mode: "webchat",
-            },
-          },
-        };
+        const client = createBindingClient({
+          profileId: profile.id,
+          signal: connection.signal,
+          dashboard: true,
+          scopes: ["operator.write"],
+        });
+        client.connId = "reaction-source-client";
         const broadcast = vi.fn();
-        const context = {
-          chatAbortControllers: new Map(),
-          chatQueuedTurns: new Map(),
-          chatRunState: createChatRunState(),
-          dedupe: new Map(),
-          agentRunSeq: new Map(),
-          getRuntimeConfig,
-          addChatRun: vi.fn(),
-          removeChatRun: (runId: string) => sources.get(runId)?.finished.resolve(),
-          broadcast,
-          broadcastToConnIds: vi.fn(),
-          nodeSendToSession: vi.fn(),
-          getSessionEventSubscriberConnIds: () => new Set<string>(),
-          logGateway: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
-        } as unknown as GatewayRequestContext;
+        const context = createBindingContext();
+        context.removeChatRun = (runId: string) => {
+          sources.get(runId)?.finished.resolve();
+          return undefined;
+        };
+        context.broadcast = broadcast;
         type Source = {
           entered: ReturnType<typeof createDeferred<DispatchOptions>>;
           release: ReturnType<typeof createDeferred<void>>;

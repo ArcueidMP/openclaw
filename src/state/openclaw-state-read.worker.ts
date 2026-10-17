@@ -1,5 +1,9 @@
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import { getSqliteRuntimeCapabilities } from "../infra/bun-sqlite-library.js";
+import {
+  getDatabaseEngineSelection,
+  withDatabaseEngineSelection,
+} from "../infra/database-engine/context.js";
 import { bunSqliteNativeCleanupPending } from "../infra/node-sqlite.js";
 import { withSqliteReaderOwner } from "../infra/sqlite-reader-lifecycle.js";
 import { runWithSqliteWorkerStateContext } from "../infra/sqlite-worker-state-context.js";
@@ -11,6 +15,7 @@ import {
   readOpenClawStateReadOnlyLocation,
   withOpenClawStateReadOnlyLocation,
 } from "./openclaw-state-db-read-connection.js";
+import { stateReadRegistry } from "./openclaw-state-read-operation-registry.js";
 import type {
   OpenClawStateReadReply,
   OpenClawStateReadRequest,
@@ -29,16 +34,18 @@ serveOwnedWorkerTasks(
         input.command.type === "gatewayOwnerLease.read"
           ? await import("../infra/gateway-owner-lease.worker.js")
           : undefined;
-      const handlers =
+      const dedicatedRead =
         input.command.type === "admit" ||
         input.command.type === "plugins.metadata.read" ||
-        input.command.type === "gatewayOwnerLease.read"
-          ? undefined
-          : await import("./openclaw-state-read-handlers.js");
-      const prepared = handlers?.stateReadRegistry.prepare(input.command.type);
+        input.command.type === "gatewayOwnerLease.read";
+      const prepared = dedicatedRead ? undefined : stateReadRegistry.prepare(input.command.type);
       if (prepared) {
         return prepared.then(() => read(input, channel, control));
       }
+      const handlers =
+        dedicatedRead || stateReadRegistry.has(input.command)
+          ? undefined
+          : await import("./openclaw-state-read-handlers.js");
       const executeRead = async (): Promise<OpenClawStateReadReply> => {
         if (input.checkFreshAdmission) {
           openClawStateDatabaseCache.assertOpenClawStateDatabaseFreshOpenAllowedAtPath(
@@ -85,6 +92,16 @@ serveOwnedWorkerTasks(
             command.schemaMaintenance,
           );
           return { ok: true, type: command.type, sourceAdmitted: true, lease };
+        }
+        if (stateReadRegistry.has(command)) {
+          const result = withOpenClawStateReadOnlyLocation(
+            ({ db }) => {
+              sourceAdmitted = true;
+              return stateReadRegistry.execute(command, db);
+            },
+            ...locationArgs,
+          );
+          return { ok: true, sourceAdmitted: true, ...result };
         }
         if (!handlers) {
           throw new Error("State read command handlers are unavailable");
@@ -153,10 +170,12 @@ serveOwnedWorkerTasks(
         );
         return { ok: true, sourceAdmitted: true, ...result };
       };
-      const reply = await withSqliteReaderOwner(
-        { operation: input.command.type, ownerKind: "worker" },
-        () => runWithSqliteWorkerStateContext(input.context, executeRead),
-      );
+      const selection = input.context.databaseEngineSelection ?? getDatabaseEngineSelection();
+      const run = () =>
+        withSqliteReaderOwner({ operation: input.command.type, ownerKind: "worker" }, () =>
+          runWithSqliteWorkerStateContext(input.context, executeRead),
+        );
+      const reply = await (selection ? withDatabaseEngineSelection(selection, run) : run());
       if (
         !getSqliteRuntimeCapabilities().explicitSqliteCloseReleasesNativeResources &&
         bunSqliteNativeCleanupPending

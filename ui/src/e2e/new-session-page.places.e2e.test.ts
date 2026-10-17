@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Page } from "playwright";
 import { expect, it } from "vitest";
+import { waitForLayoutSettled } from "../pages/chat/chat-layout.browser.test-support.ts";
 import { takeControlUiScreenshotFrame } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { revealChatModelOption } from "../test-helpers/select-picker-e2e.ts";
 import {
@@ -229,6 +230,7 @@ suite.define(() => {
           .count(),
       ).toBe(0);
       const fastMode = page.locator('.new-session-page__composer [data-chat-speed-option="on"]');
+      await page.locator('.new-session-page__composer [data-chat-thinking-select="true"]').click();
       expect(await fastMode.count()).toBe(1);
       expect(await fastMode.getAttribute("aria-checked")).toBe("false");
       expect(
@@ -236,6 +238,7 @@ suite.define(() => {
           element.classList.contains("chat-controls__speed-option"),
         ),
       ).toBe(true);
+      await page.keyboard.press("Escape");
       expect(await incognitoToggle.getAttribute("aria-checked")).toBe("false");
       await incognitoToggle.click();
       await expect.poll(() => incognitoToggle.getAttribute("aria-checked")).toBe("true");
@@ -244,7 +247,7 @@ suite.define(() => {
 
       // Unified layout: the trigger row (menus above the composer) sits
       // inside the start-screen welcome, below the hero.
-      const heroBox = await page.locator(".agent-chat__welcome h2").boundingBox();
+      const heroBox = await page.locator(".agent-chat__welcome-identity").boundingBox();
       const triggersBox = await page.locator(".new-session-page__triggers").boundingBox();
       const composerBox = await page.locator(".new-session-page__composer").boundingBox();
       const modelBox = await page.locator('[data-chat-model-select="true"]').boundingBox();
@@ -335,6 +338,11 @@ suite.define(() => {
       };
       await expect.poll(() => mobileModelSettings.isVisible()).toBe(true);
       await expect.poll(permissionIconCenterError).toBeLessThanOrEqual(1);
+      // Visibility and centered icons also hold before the responsive layout lands.
+      await waitForLayoutSettled(
+        page,
+        '.new-session-page__composer .agent-chat__composer-footer, .new-session-page__composer [data-chat-model-select="true"]',
+      );
       const [mobileFooterBox, mobileModelSettingsBox] = await Promise.all([
         page.locator(".new-session-page__composer .agent-chat__composer-footer").boundingBox(),
         mobileModelSettings.boundingBox(),
@@ -361,7 +369,7 @@ suite.define(() => {
         .poll(() => page.locator(".chat-controls__permission-option").first().isVisible())
         .toBe(true);
       await captureProjectUiProof(suite, page, "mobile-new-session-permissions-open.png", {
-        surface: page.locator('.chat-controls__permission-picker [part="menu"]'),
+        surface: page.locator(".chat-controls__permission-menu"),
         content: [page.locator(".chat-controls__permission-option").first()],
       });
       await page.keyboard.press("Escape");
@@ -374,7 +382,7 @@ suite.define(() => {
         await revealChatModelOption(capturedModelOption);
       }
       await captureProjectUiProof(suite, page, "mobile-new-session-model-open.png", {
-        surface: page.locator('.chat-controls__model-picker wa-popup [part="popup"]'),
+        surface: page.locator(".chat-controls__model-picker > [data-anchored-overlay]"),
         content: [capturedModelOption],
       });
       expect(
@@ -387,7 +395,7 @@ suite.define(() => {
       await page.locator('[data-chat-thinking-select="true"]').click();
       await expect.poll(() => page.locator(".chat-controls__effort-menu").isVisible()).toBe(true);
       await captureProjectUiProof(suite, page, "mobile-new-session-effort-open.png", {
-        surface: page.locator('.chat-controls__effort-picker wa-popup [part="popup"]'),
+        surface: page.locator(".chat-controls__effort-picker > [data-anchored-overlay]"),
         content: [fastMode],
       });
       await page.keyboard.press("Escape");
@@ -521,8 +529,13 @@ suite.define(() => {
             element.addEventListener("overlay-after-hide", () => resolve(), { once: true });
           }),
       );
-      await page.locator(".agent-chat__welcome h2").click();
+      // The name now opens the agent picker; use the visible, noninteractive avatar
+      // to prove outside-pointer dismissal without opening a sibling menu.
+      await page.locator(".agent-chat__welcome-avatar").click();
       await afterPointerHide;
+      expect(
+        await agentPicker.locator(".agent-select__trigger").getAttribute("aria-expanded"),
+      ).toBe("false");
       await expect
         .poll(() => checkoutSelect.evaluate((element) => element.matches(":popover-open")))
         .toBe(false);
@@ -561,6 +574,119 @@ suite.define(() => {
       await expect
         .poll(() => new URL(page.url()).pathname)
         .toBe(controlUiSessionPath("agent:main:draft-e2e"));
+    } finally {
+      await context.close();
+    }
+  });
+
+  it("selects an eligible checkout for a restricted registered project", async () => {
+    const context = await suite.browser.newContext({
+      locale: "en-US",
+      serviceWorkers: "block",
+      viewport: { height: 900, width: 1280 },
+      ...(captureUiProofEnabled
+        ? {
+            recordVideo: {
+              dir: path.join(suite.artifactDir, "checkout-choice"),
+              size: { height: 900, width: 1280 },
+            },
+          }
+        : {}),
+    });
+    const page = await context.newPage();
+    const gateway = await installMockGateway(page, {
+      operatorScopes: ["operator.read", "operator.sessions.write"],
+      workspace: WORKSPACE,
+      workspaceGit: true,
+      featureMethods: [
+        "chat.metadata",
+        "chat.startup",
+        "sessions.create",
+        "sessions.dispatch",
+        "projects.list",
+        "projects.checkoutOptions",
+        "worktrees.branches",
+      ],
+      methodResponses: {
+        "projects.list": {
+          projects: [
+            { id: "sample-project", displayName: "Sample Project", source: "registered" },
+            { id: "allowed-project", displayName: "Workspace Project", source: "registered" },
+          ],
+        },
+        "projects.checkoutOptions": {
+          cases: [
+            {
+              match: { projectId: "allowed-project" },
+              response: { current: true, worktree: true },
+            },
+            { response: { current: false, worktree: true } },
+          ],
+        },
+        "worktrees.branches": {
+          branches: [{ kind: "local", name: "main" }],
+          repositoryStatus: "git",
+        },
+        "sessions.create": { key: "agent:main:checkout-choice" },
+      },
+    });
+    try {
+      await page.goto(`${suite.server.baseUrl}new`);
+      await gateway.waitForRequest("projects.list");
+      const message = page.locator(".new-session-page__message");
+      await message.fill("Inspect the project and explain the next change.");
+      await page.locator("#new-session-project-trigger").click();
+      await page
+        .locator(".new-session-page__project-popover")
+        .getByRole("button", { name: "Sample Project", exact: true })
+        .click();
+      const trigger = page.locator("#new-session-checkout-trigger");
+      await trigger.click();
+      const checkout = page.locator(".oc-popover.new-session-page__checkout-popover");
+      await expect.poll(() => trigger.getAttribute("data-worktree")).toBe("true");
+      const current = checkout.locator('[data-value="checkout"]');
+      expect(await current.isDisabled()).toBe(true);
+      expect(await current.textContent()).toContain(
+        "Use an isolated worktree for this project and agent",
+      );
+      await captureProjectUiProof(suite, page, "checkout-choice.png", {
+        surface: checkout,
+        content: [current],
+      });
+      if (captureUiProofEnabled) {
+        await page.waitForTimeout(750);
+      }
+      await page.keyboard.press("Escape");
+      await page.locator("#new-session-project-trigger").click();
+      await page
+        .locator(".new-session-page__project-popover")
+        .getByRole("button", { name: "Workspace Project", exact: true })
+        .click();
+      await trigger.click();
+      await expect.poll(() => current.isDisabled()).toBe(false);
+      expect(await trigger.getAttribute("data-worktree")).toBe("true");
+      await current.click();
+      await expect.poll(() => trigger.getAttribute("data-worktree")).toBe("false");
+      if (captureUiProofEnabled) {
+        await page.waitForTimeout(750);
+      }
+      await page.keyboard.press("Escape");
+      await page.locator("#new-session-project-trigger").click();
+      await page
+        .locator(".new-session-page__project-popover")
+        .getByRole("button", { name: "Sample Project", exact: true })
+        .click();
+      await expect.poll(() => trigger.getAttribute("data-worktree")).toBe("true");
+      expect(await message.inputValue()).toBe("Inspect the project and explain the next change.");
+      await page.getByRole("button", { name: "Start session" }).click();
+      const create = await gateway.waitForRequest("sessions.create");
+      expect(create.params).toMatchObject({
+        agentId: "main",
+        projectId: "sample-project",
+        worktree: true,
+        message: "Inspect the project and explain the next change.",
+      });
+      expect(create.params).not.toHaveProperty("cwd");
     } finally {
       await context.close();
     }

@@ -1,6 +1,6 @@
 // Control UI test helper supports control ui e2e setup.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,6 +46,7 @@ import {
 import { resolveAvailableLoopbackPort } from "./control-ui-e2e-port.ts";
 import {
   controlUiE2eWaitTimeoutMs,
+  extendControlUiE2eWaitTimeoutForSourceServer,
   waitForControlUiInitialRoster,
 } from "./control-ui-e2e-readiness.ts";
 import { getSharedControlUiE2ePreview } from "./control-ui-e2e-shared-preview.ts";
@@ -373,8 +374,6 @@ export type ControlUiMockGatewayScenario = {
   assistantName?: string;
   automaticallyFetchFavicons?: boolean;
   communityInvite?: boolean;
-  /** Only invitation behavior tests opt into a fresh visitor; visual proofs keep it dismissed. */
-  communityInviteDismissed?: boolean;
   basePath?: string;
   controlUiTabs?: Array<{
     group?: string;
@@ -551,44 +550,17 @@ export async function reconnectMockGateway(
   );
 }
 
-const chromiumExecutableOverrideEnvKey = "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH";
-export const systemChromiumExecutableCandidates = [
-  "/snap/bin/chromium",
-  "/usr/bin/chromium-browser",
-  "/usr/bin/chromium",
-  "/usr/bin/google-chrome",
-  "/usr/bin/google-chrome-stable",
-] as const;
-
 function resolveRepoRoot(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
   return path.resolve(here, "../../..");
 }
 
-export function resolvePlaywrightChromiumExecutablePath(
-  defaultExecutablePath: string,
-  env: NodeJS.ProcessEnv = process.env,
-  canRun: (chromiumExecutablePath: string) => boolean = canRunPlaywrightChromium,
-): string {
-  const executableOverride = env[chromiumExecutableOverrideEnvKey]?.trim();
-  if (executableOverride) {
-    return executableOverride;
-  }
-  if (canRun(defaultExecutablePath)) {
-    return defaultExecutablePath;
-  }
-  return (
-    systemChromiumExecutableCandidates.find((candidate) => canRun(candidate)) ??
-    defaultExecutablePath
-  );
-}
-
-export function canRunPlaywrightChromium(chromiumExecutablePath: string): boolean {
-  if (!existsSync(chromiumExecutablePath)) {
-    return false;
-  }
-  return spawnSync(chromiumExecutablePath, ["--version"], { stdio: "ignore" }).status === 0;
-}
+// Many UI tests and proof scripts import Chromium selection through this helper.
+export {
+  canRunPlaywrightChromium,
+  resolvePlaywrightChromiumExecutablePath,
+  systemChromiumExecutableCandidates,
+} from "./playwright-chromium.ts";
 
 // Pause an installed virtual clock slightly ahead of its current time so
 // elapsed time advances only through clock.runFor/fastForward. Without this,
@@ -613,6 +585,7 @@ export async function startControlUiE2eServer(
       close: async () => {},
     };
   }
+  extendControlUiE2eWaitTimeoutForSourceServer();
   const resolvedBuildInfo = normalizeControlUiBuildInfo(
     buildInfo ?? DEFAULT_CONTROL_UI_E2E_BUILD_INFO,
   );
@@ -622,6 +595,7 @@ export async function startControlUiE2eServer(
     { createServer },
     { controlUiLocaleModulesPlugin },
     { controlUiSolidPlugin },
+    { controlUiPluginDistributionsPlugin },
     {
       commonJsOptimizeDeps,
       resolveExternalPackageAliasesForVite,
@@ -632,6 +606,7 @@ export async function startControlUiE2eServer(
     import("vite"),
     import("../../config/control-ui-locales.ts"),
     import("../../config/control-ui-solid.ts"),
+    import("../../config/control-ui-plugin-distributions.ts"),
     import("../../vite.config.ts"),
   ]);
   const repoRoot = resolveRepoRoot();
@@ -647,10 +622,14 @@ export async function startControlUiE2eServer(
     },
     logLevel: "error",
     optimizeDeps: {
-      include: ["ipaddr.js", "lit/directives/repeat.js", ...commonJsOptimizeDeps],
+      include: ["ipaddr.js", ...commonJsOptimizeDeps],
     },
     publicDir: path.join(uiRoot, "public"),
-    plugins: [controlUiSolidPlugin(), controlUiLocaleModulesPlugin()],
+    plugins: [
+      controlUiSolidPlugin(),
+      controlUiLocaleModulesPlugin(),
+      controlUiPluginDistributionsPlugin(repoRoot, new Set()),
+    ],
     resolve: {
       alias: [
         { find: "json5", replacement: json5EsmPath },
@@ -911,8 +890,7 @@ function normalizeScenario(
     pluginAssetsRequireAuth: scenario.pluginAssetsRequireAuth ?? true,
     attachmentMaxBytes: scenario.attachmentMaxBytes ?? DEFAULT_MOCK_ATTACHMENT_MAX_BYTES,
     automaticallyFetchFavicons: scenario.automaticallyFetchFavicons ?? false,
-    communityInvite: scenario.communityInvite ?? true,
-    communityInviteDismissed: scenario.communityInviteDismissed ?? true,
+    communityInvite: scenario.communityInvite ?? false,
     agentModel:
       scenario.agentModel === undefined ? "openai/gpt-5.5" : scenario.agentModel?.trim() || null,
     assistantAgentId: scenario.assistantAgentId?.trim() || defaultAgentId,
@@ -1084,17 +1062,6 @@ function installControlUiMockGateway(
   };
 
   const scenario = input.scenario;
-  if (scenario.communityInviteDismissed) {
-    try {
-      // Same persisted preference as community-invite-state.ts, before the first sidebar render.
-      window.localStorage.setItem(
-        "openclaw:control-ui:community-invite:v2",
-        JSON.stringify({ dismissedAtMs: 1770000000000 }),
-      );
-    } catch {
-      // The product already suppresses the invitation when storage is unavailable.
-    }
-  }
   const serverBuildIdStateKey = "openclaw.control-ui-e2e.serverBuildId";
   let serverBuildId = scenario.serverBuildId;
   let gatewayBootId =

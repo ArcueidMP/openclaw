@@ -37,19 +37,25 @@ function makeTerminalSessionMocks() {
 }
 
 export function makeTerminalGatewayOpts(
-  params: unknown,
-  terminalConfig: { enabled?: boolean } | undefined,
-  terminalPolicyConfig?: OpenClawConfig,
-  nodeRegistry: {
-    get: (nodeId: string) => unknown;
-    invoke?: (params: unknown) => Promise<unknown>;
-  } = { get: () => undefined },
+  params: Record<string, unknown> = { cols: 80, rows: 24 },
+  {
+    enabled = true,
+    preparedConfig,
+    nodeRegistry = { get: () => undefined },
+  }: {
+    enabled?: boolean;
+    preparedConfig?: OpenClawConfig;
+    nodeRegistry?: {
+      get: (nodeId: string) => unknown;
+      invoke?: (params: unknown) => Promise<unknown>;
+    };
+  } = {},
 ) {
   const sessions = makeTerminalSessionMocks();
-  const runtimeConfig: OpenClawConfig = { gateway: { terminal: terminalConfig } };
+  const runtimeConfig: OpenClawConfig = { gateway: { terminal: { enabled } } };
   const policy = createTerminalLaunchPolicy(runtimeConfig);
-  if (terminalPolicyConfig) {
-    policy.prepareConfig(terminalPolicyConfig, { restartPending: true });
+  if (preparedConfig) {
+    policy.prepareConfig(preparedConfig, { restartPending: true });
   }
   const respond = vi.fn();
   const isConnectionActive = vi.fn(() => true);
@@ -65,7 +71,7 @@ export function makeTerminalGatewayOpts(
     logGateway: { info: vi.fn() },
   } as unknown as Parameters<(typeof terminalHandlers)["terminal.input"]>[0]["context"];
   const opts = {
-    params: params as Record<string, unknown>,
+    params,
     respond,
     context,
     client: { connId: "conn-1", connect: {} },

@@ -15,13 +15,7 @@ import type {
   OpenClawPluginServiceContext,
 } from "../api.js";
 import { isInternalDiagnosticEventMetadata, redactSensitiveText } from "../api.js";
-import {
-  escapeHelp,
-  formatLabels,
-  formatPrometheusNumber,
-  seconds,
-  type LabelSet,
-} from "./prometheus-format.js";
+import { seconds, type LabelSet } from "./prometheus-format.js";
 import {
   AGENT_DURATION_BUCKETS_SECONDS,
   createPrometheusMetricStore,
@@ -53,52 +47,6 @@ function safeErrorMessage(err: unknown): string {
   );
 }
 
-function renderPrometheusMetrics(store: PrometheusMetricStore): string {
-  const snapshot = store.snapshot();
-  const lines: string[] = [];
-  const emitted = new Set<string>();
-
-  const emitHeader = (name: string, type: "counter" | "gauge" | "histogram", help: string) => {
-    if (emitted.has(name)) {
-      return;
-    }
-    emitted.add(name);
-    lines.push(`# HELP ${name} ${escapeHelp(help)}`);
-    lines.push(`# TYPE ${name} ${type}`);
-  };
-
-  for (const [type, entries] of [
-    ["counter", snapshot.counters],
-    ["gauge", snapshot.gauges],
-  ] as const) {
-    entries.sort(([left], [right]) => left.localeCompare(right));
-    for (const [key, sample] of entries) {
-      const name = key.split("|", 1)[0] ?? "";
-      emitHeader(name, type, sample.help);
-      lines.push(`${name}${formatLabels(sample.labels)} ${formatPrometheusNumber(sample.value)}`);
-    }
-  }
-
-  snapshot.histograms.sort(([left], [right]) => left.localeCompare(right));
-  for (const [key, sample] of snapshot.histograms) {
-    const name = key.split("|", 1)[0] ?? "";
-    emitHeader(name, "histogram", sample.help);
-    for (let index = 0; index < sample.buckets.length; index += 1) {
-      lines.push(
-        `${sample.bucketPrefixes[index]}${formatPrometheusNumber(sample.counts[index] ?? 0)}`,
-      );
-    }
-    lines.push(
-      `${sample.bucketPrefixes[sample.buckets.length]}${formatPrometheusNumber(sample.count)}`,
-    );
-    lines.push(`${name}_sum${sample.labels} ${formatPrometheusNumber(sample.sum)}`);
-    lines.push(`${name}_count${sample.labels} ${formatPrometheusNumber(sample.count)}`);
-  }
-
-  lines.push("");
-  return lines.join("\n");
-}
-
 function webhookLabels(
   evt: Extract<
     DiagnosticEventPayload,
@@ -121,6 +69,35 @@ function recordDiagnosticEvent(
   }
 
   switch (evt.type) {
+    case "gateway.ws.event": {
+      if (!metadata.trusted) {
+        return;
+      }
+      const labels = { event: evt.event };
+      store.counter(
+        "openclaw_gateway_ws_events_total",
+        "Outbound Gateway WebSocket event frames accepted by the sender per socket.",
+        labels,
+        evt.count,
+      );
+      store.counter(
+        "openclaw_gateway_ws_event_bytes_total",
+        "Encoded outbound Gateway WebSocket event bytes before framing or compression per socket.",
+        labels,
+        evt.bytes,
+      );
+      return;
+    }
+    case "gateway.ws.connections":
+      if (metadata.trusted) {
+        store.gauge(
+          "openclaw_gateway_ws_operator_connections",
+          "Connected authenticated Gateway operator WebSockets.",
+          {},
+          evt.operators,
+        );
+      }
+      return;
     case "worker.request":
       if (metadata.trusted) {
         recordWorkerRequest(store, evt);
@@ -133,6 +110,7 @@ function recordDiagnosticEvent(
     case "gateway.http.cancelled":
     case "diagnostic.gc":
     case "gateway.event_loop.sample":
+    case "gateway.main_thread.stall":
       recordOperationTimingEvent(store, evt, metadata);
       return;
     case "model.usage":
@@ -601,7 +579,7 @@ function createMetricsHandler(store: PrometheusMetricStore): OpenClawPluginHttpR
       return true;
     }
 
-    const body = renderPrometheusMetrics(store);
+    const body = store.render();
     res.statusCode = 200;
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
@@ -711,7 +689,7 @@ export function createDiagnosticsPrometheusExporter() {
 
   return {
     handler: createMetricsHandler(store),
-    render: () => renderPrometheusMetrics(store),
+    render: store.render,
     service,
   };
 }
